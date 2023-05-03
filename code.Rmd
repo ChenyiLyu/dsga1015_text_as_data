@@ -1,0 +1,472 @@
+---
+title: "Final Project - Text as Data"
+author: "Chenyi Lyu"
+date: "Apr 2023"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list=ls())
+```
+
+```{r echo = TRUE, message = FALSE}
+pacman::p_load(textclean,
+               tidytext,
+               lsa,
+               tidyverse,
+               readr,
+               quanteda, quanteda.corpora, quanteda.textstats, quanteda.textplots,
+               dplyr,
+               ggplot2,
+               quanteda.textmodels,
+               stringr,
+               caret,
+               randomForest,
+               readtext,
+               lubridate,
+               ldatuning,
+               topicmodels,
+               factoextra,
+               text2vec,
+               bursts,
+               stm,
+               Rtsne,
+               rsvd,geometry,
+               wordcloud,
+               textdata,
+               syuzhet,stm,reshape, reshape2,
+               viridis, hrbrthemes)
+```
+
+
+
+```{r}
+tweets <- read_csv("data/tweets.csv")
+
+# By observation, some invalid tweet records has date value eval to null
+tweets <- tweets[!is.na(tweets$date),]
+
+# enforce hashtags column to list type  
+tweets$hashtags <- gsub("[^[:alpha:],]+", "", tweets$hashtags) %>% # remove non-alphabetic characters and commas
+     strsplit(",") %>% # split by comma
+     lapply(tolower)
+
+
+# extract date
+tweets$date <- mdy(paste(month(tweets$date), 
+                             day(tweets$date), 
+                             year(tweets$date), 
+                             sep = "-")) # date only
+
+glimpse(tweets, show_col_types = FALSE)
+```
+```{r}
+# Notice there are some tweets writtern by bots
+bots <- grep('Bot|bot|bots|Bots',tweets$source)
+tweets <- tweets[-grep('Bot|bot|bots|Bots',tweets$source),]
+cat('Removed', length(bots), 'tweets written by bots.\n')
+```
+
+```{r}
+# 20 most common hashtags.
+tweets$hashtags %>%
+  unlist %>%            
+  table %>%            
+  sort(decreasing = TRUE) %>% 
+  head(20)
+```
+## Preprocessing
+### Text manipulation
+```{r}
+# Prune tweets df
+tweets_sub <- subset(tweets, select=c('date','text'))
+
+# pre-processing text
+clean_text <- function(x)
+{
+  # Ignore graphical Parameters to avoid input errors
+  x = str_replace_all(x,"[^[:graph:]]", " ")
+  # convert to lower case
+  x = tolower(x)
+  # remove links https://t.co/
+  x = gsub("https://t.co/\\w+", " ", x)
+  # remove links http
+  x = gsub("http\\w+", " ", x)
+  # remove non ascii characters
+  x = gsub('[^\x20-\x7E]', " ", x)
+  # remove punctuation
+  x = gsub("[[:punct:]]", " ", x)
+  # remove numbers
+  x = gsub("[[:digit:]]", " ", x)
+  # remove tabs
+  x = gsub("[ |\t]{2,}", " ", x)
+  # other cleaning text
+  x = gsub('[[:cntrl:]]', " ", x)
+  # removes solitary letters
+  x = gsub("\\b[A-Za-z]\\b", " ", x)
+  # remove extra spaces
+  x = str_squish(x)
+  return(x)
+}
+system.time(
+tweets_sub$cleaned <- clean_text(tweets_sub$text)
+)
+# remove empty results (if any)
+idx <- which(tweets_sub$cleaned == "")
+tweets_sub$cleaned <- tweets_sub$cleaned[tweets_sub$cleaned != " "]
+```
+
+## EDA
+```{r}
+# options(repr.plot.width=15, repr.plot.height=9)
+my_colors <- c("#05A4C0", "#85CEDA", "#D2A7D8", "#A67BC5", "#BB1C8B", "#8D266E")
+# show_col(my_colors, labels = F, borders = NA)
+axis.title.x = element_text(margin = ggplot2::margin(0,20,0,0))
+# Custom Theme Variable
+my_theme <- theme(plot.background = element_rect(fill = "grey98", color = "grey20"),
+                  panel.background = element_rect(fill = "grey98"),
+                  panel.grid.major = element_line(colour = "grey87"),
+                  text = element_text(color = "grey20"),
+                  plot.title = element_text(size = 22),
+                  plot.subtitle = element_text(size = 17),
+                  axis.title = element_text(size = 15),
+                  axis.text = element_text(size = 15),
+                  legend.box.background = element_rect(color = "grey20", fill = "grey98", size = 0.1),
+                  legend.box.margin = margin(t = 3, r = 3, b = 3, l = 3),
+                  legend.title = element_blank(),
+                  legend.text = element_text(size = 15),
+                  strip.text = element_text(size=17))
+tweets_sub %>% 
+    select(date) %>% 
+    group_by(date) %>% 
+    summarize(n = n(), .groups = "drop_last") %>%
+    ggplot(aes(x=date, y = n)) + 
+    geom_line(size = 1.5, color = my_colors[1]) +
+    coord_cartesian(clip = 'off') +
+    theme(axis.title.x = element_blank()) +
+    labs(title = "Number of Tweets in Time", subtitle = "2022.12-2023.4", y = "Frequency")
+```
+
+### Tokenization and dfm creation
+```{r}
+# Collapse tweets by dates
+system.time(
+tweets_date <- tweets_sub %>% 
+  select(c('date', 'cleaned')) %>% 
+  group_by(date) %>% 
+  summarise(text = paste(cleaned, collapse = " ")))
+
+# saveRDS(tweets_date, file = './data/tweets_date.rds')
+
+# Tokenize
+system.time(td_tokens <- tokens(tweets_date$text))
+```
+```{r}
+# remove stop words
+td_tokens <- tokens_remove(td_tokens, stopwords("en"))
+# saveRDS(td_tokens, file = './data/td_tokens.rds')
+td_tokens <- readRDS("data/td_tokens.rds")
+tweets_date <- readRDS("data/tweets_date.rds")
+
+td_dfm <- dfm(td_tokens)
+td_dfm
+topfeatures(td_dfm, n = 10, scheme = "docfreq", decreasing = FALSE)
+# remove sparse features
+td_dfm <- dfm_trim(td_dfm, min_termfreq = 50, verbose = TRUE)
+# saveRDS(td_dfm, file = './data/td_dfm.rds')
+
+```
+
+### wordcloud at a glimpse
+```{r}
+textplot_wordcloud(dfm_trim(td_dfm, max_termfreq = 100000), min_count = 3000, random_order = FALSE, random_color = FALSE,
+                   rotation = .25,
+                   color = RColorBrewer::brewer.pal(8, "Dark2"))
+```
+
+## build Topic Model with LDA
+```{r}
+system.time({
+  tunes <- FindTopicsNumber(
+    dtm = td_dfm,
+    topics = seq(4,20,by=2),
+    metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010"),
+    method = "Gibbs",
+    control = list(seed = 1234, iter=3000),
+    mc.cores = 6,
+    verbose = TRUE
+  )
+})
+FindTopicsNumber_plot(tunes)
+```
+
+```{r}
+# Set number of topics
+# tune model with different K, alpha, beta
+
+k <- 6
+
+# Fit the topic model with the chosen k
+system.time(
+  td_tm_01_01 <- LDA(td_dfm, k = k, method = "Gibbs",  control = list(seed = 1234, iter=3000, alpha=.1, delta=.1)))
+
+cat("@loglikelihood of the topic model: ", td_tm@loglikelihood, "\n")
+saveRDS(td_tm_01_01, file="data/td_tm_6_01_01.rds")
+# 
+# # Fit the topic model with the chosen k
+# system.time(
+#   td_tm_05_05 <- LDA(td_dfm, k = k, method = "Gibbs",  control = list(seed = 1234, iter=3000, alpha=.5, delta=.5)))
+# 
+# cat("@loglikelihood of the topic model: ", td_tm@loglikelihood, "\n")
+# saveRDS(td_tm_05_05, file="data/td_tm_6_05_05.rds")
+# 
+# # Fit the topic model with the chosen k
+# system.time(
+#   td_tm_05_01 <- LDA(td_dfm, k = k, method = "Gibbs",  control = list(seed = 1234, iter=3000, alpha=.5, delta=.1)))
+# 
+# cat("@loglikelihood of the topic model: ", td_tm@loglikelihood, "\n")
+# saveRDS(td_tm_05_01, file="data/td_tm_6_05_01.rds")
+```
+
+### exam the perplexity
+```{r}
+# read the saved model
+et_dfm <- readRDS(file="data/td_dfm.rds")
+et_tm_6 <- readRDS(file="data/td_tm_6_01_01.rds")
+et_tm_10 <- readRDS(file="data/td_tm_10_01_01.rds")
+et_tm_18 <- readRDS(file="data/td_tm_18_01_01.rds")
+
+set.seed(42)
+dtm <- convert(et_dfm, to="topicmodels")
+p6 <- topicmodels::perplexity(et_tm_6, dtm)
+p10 <- topicmodels::perplexity(et_tm_10, dtm)
+p18 <- topicmodels::perplexity(et_tm_18, dtm)
+
+p_df <- data.frame(k=c(6,10,18))
+p_df$perplexity <- c(p6,p10,p18)
+p_df
+plot(p_df, type="b")
+```
+
+
+```{r}
+td_tm <- readRDS(file="data/td_tm_10_01_01.rds")
+terms <- get_terms(td_tm, k=10)
+topics_2 <- topics(td_tm, k=2)
+terms
+t_count <- data.frame(table(topics_2[1,]))
+colnames(t_count) <- c('top_topic', 'count')
+t_count <- t_count[order(t_count$count, decreasing = TRUE),]
+t_count
+```
+
+### stability analysis
+```{r}
+et_tm_d_1 <- td_tm
+et_tm_d_2 <- td_tm_10
+b_beta <- et_tm_d_1@beta
+a_beta <- et_tm_d_2@beta
+temp <- vector(mode="numeric", length=10)
+for (i in seq(10)) {
+  similarity <- vector(mode="numeric", length=10)
+  for (j in seq(10)) {
+    similarity[j] <- cosine(b_beta[i,], a_beta[j,])
+  }
+  temp[i] <- order(similarity,decreasing=TRUE)[1]
+}
+closest_match <- data.frame(new_topic=seq(10))
+closest_match$old_topic <- temp
+closest_match
+
+old_terms <- data.frame(terms(et_tm_d_1, k=10))
+new_terms <- data.frame(terms(et_tm_d_2, k=10))
+counts <- vector()
+matched <- vector()
+for (i in seq(10)) {
+  new_topic <- closest_match[i,1]
+  old_topic <- closest_match[i,2]
+  
+  counts <- append(counts,
+                   length(intersect(old_terms[,old_topic],new_terms[,new_topic])))
+}
+match_tbl <- data.frame(new_topic=closest_match$new_topic,old_topic=closest_match$old_topic, counts=counts)
+match_tbl
+mean(match_tbl$counts)
+```
+
+
+### stm
+The number of topics selected in the fitted model is 70. 88 iterations completed before the model converged
+```{r}
+# construct samples
+set.seed(42)
+# table(tweets_sub$date)
+sampled_tweets <- tweets_sub %>% 
+  select(c('date', 'cleaned')) %>% 
+  group_by(date) %>% 
+  slice_sample(n=1000, replace=FALSE)
+# sampled_tweets$date <- as.numeric(sampled_tweets$date)
+# preprocessing
+sampled_tweets_dfm <- tokens(sampled_tweets$cleaned) %>%
+                  dfm() %>% 
+                  dfm_remove(c(stopwords("english")))
+sampled_tweets_dfm$date <- sampled_tweets$date
+# run model
+system.time(
+tweet_stm <- stm(sampled_tweets_dfm, K=0, init.type='Spectral', seed=100, prevalence =~s(date), data=sampled_tweets)
+)
+# saveRDS(tweet_stm, file='data/tweet_stm.rds')
+
+```
+
+```{r}
+tweet_stm <- readRDS('data/tweet_stm.rds')
+tweet_stm
+```
+
+
+```{r}
+# all topics
+plot.STM(tweet_stm, type="summary")
+# select the top5
+top5 <- order(colSums(tweet_stm$theta), decreasing = TRUE)[1:10]
+plot.STM(tweet_stm, type="summary", topics=top5)
+labelTopics(tweet_stm,top5)
+```
+
+
+```{r}
+reformed_data <- sampled_tweets
+reformed_data$date <- as.numeric(reformed_data$date)
+prep <- estimateEffect(c(55) ~ s(date) , 
+                       tweet_stm, 
+                       nsims = 25,
+                       meta = reformed_data)
+
+# Plots the distribution of topics over time
+plot(prep, 
+     "date", 
+     model = tweet_stm, 
+     topics = c(55), 
+     method = "continuous", 
+     xaxt = "n", 
+     xlab = "Date")
+```
+
+
+```{r}
+prep <- estimateEffect(c(55) ~ s(date) , 
+                       tweet_stm, 
+                       nsims = 25,
+                       meta = reformed_data)
+plot(prep, 
+     "date", 
+     model = tweet_stm, 
+     topics = c(55), 
+     method = "continuous", 
+     xaxt = "n", 
+     xlab = "Date")
+monthseq <- seq(from = 19331, to = 19464)
+axis(1)
+
+# trading
+prep <- estimateEffect(c(10) ~ s(date) , 
+                       tweet_stm, 
+                       nsims = 25,
+                       meta = reformed_data)
+plot(prep, 
+     "date", 
+     model = tweet_stm, 
+     topics = c(10), 
+     method = "continuous", 
+     xaxt = "n", 
+     xlab = "Date")
+monthseq <- seq(from = 19331, to = 19464)
+axis(1)
+# italy ban
+prep <- estimateEffect(c(62) ~ s(date) , 
+                       tweet_stm, 
+                       nsims = 25,
+                       meta = reformed_data)
+plot(prep, 
+     "date", 
+     model = tweet_stm, 
+     topics = c(62), 
+     method = "continuous", 
+     xaxt = "n", 
+     xlab = "Date")
+monthseq <- seq(from = 19331, to = 19464)
+axis(1)
+```
+
+```{r}
+# china
+prep <- estimateEffect(c(63) ~ s(date) , 
+                       tweet_stm, 
+                       nsims = 25,
+                       meta = reformed_data)
+plot(prep, 
+     "date", 
+     model = tweet_stm, 
+     topics = c(63), 
+     method = "continuous", 
+     xaxt = "n", 
+     xlab = "Date")
+monthseq <- seq(from = 19331, to = 19464)
+axis(1)
+
+# security
+prep <- estimateEffect(c(29) ~ s(date) , 
+                       tweet_stm, 
+                       nsims = 25,
+                       meta = reformed_data)
+plot(prep, 
+     "date", 
+     model = tweet_stm, 
+     topics = c(29), 
+     method = "continuous", 
+     xaxt = "n", 
+     xlab = "Date")
+monthseq <- seq(from = 19331, to = 19464)
+axis(1)
+```
+
+
+
+
+```{r}
+emo <- c('anticipation','joy', 'fear', 'positive','negative')
+# a function to evaluate sentiment for each topic
+# and filter out the emotion of interests
+get_sentiment_res <- function(x) { 
+  res <- paste(x, collapse = " ") %>% 
+    get_nrc_sentiment()
+  res <- t(apply(res, 1, function(x) x/sum(x))) %>% 
+    as.data.frame() %>% 
+    select(emo)
+  return(res)
+}
+y <- apply(get_terms(td_tm, k=3000), 2, get_sentiment_res)
+# reshape the data 
+# create data frame to store sentiment results
+y <- as.data.frame(do.call(rbind, y))
+# add topic name
+y$topic <- row.names(y)
+sent <- melt(y, id=c('topic'))
+# sent$topic <- factor(sent$topic, levels=y$topic)
+
+# Plot
+ggplot(sent, aes(x=topic, y=value, fill=variable)) + 
+  geom_bar(position="dodge", stat="identity")+
+  scale_fill_viridis(discrete = T) +
+    theme_ipsum() 
+```
+
+
+
+
+
